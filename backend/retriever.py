@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,8 @@ class Retriever:
         self.invalid_chunk_count = 0
         self.retrieval_degraded = False
         self.retrieval_error: str | None = None
+        if not hasattr(self, "_vector_sync_path"):
+            self._vector_sync_path = self.manifest_path.parent / "chroma_sync.json"
         self.reload()
 
     def reload(self) -> None:
@@ -93,29 +96,29 @@ class Retriever:
         if documents and settings.enable_vector and settings.embedding_model:
             try:
                 from langchain_chroma import Chroma
-                from langchain_openai import OpenAIEmbeddings
+                from langchain_huggingface import HuggingFaceEmbeddings
 
-                embeddings = OpenAIEmbeddings(
-                    model=settings.embedding_model,
-                    api_key=settings.openai_api_key or None,
-                    base_url=settings.openai_base_url,
+                embeddings = HuggingFaceEmbeddings(
+                    model_name=settings.embedding_model,
+                    model_kwargs={"device": settings.embedding_device},
+                    encode_kwargs={"normalize_embeddings": True},
+                    cache_folder=settings.embedding_cache_dir or None,
                 )
                 vector_store = Chroma(
                     collection_name=settings.vector_collection,
                     embedding_function=embeddings,
-                    persist_directory=str(DATA_DIR / "chroma"),
+                    persist_directory=str(self.manifest_path.parent / "chroma"),
                 )
-                vector_store.reset_collection()
-                vector_store.add_documents(
-                    documents,
-                    ids=[doc.metadata["chunk_id"] for doc in documents],
-                )
+                self._sync_vector_store(vector_store, documents)
                 mode = "hybrid"
             except Exception as exc:
-                # Keep BM25 available if the embedding dependency or service fails.
+                # Keep BM25 available if the local embedding dependency or model fails.
                 vector_store = None
                 retrieval_degraded = True
                 retrieval_error = type(exc).__name__
+        elif settings.enable_vector and settings.embedding_model:
+            retrieval_degraded = True
+            retrieval_error = "empty_index"
 
         self.documents = documents
         self.bm25 = bm25
@@ -126,6 +129,65 @@ class Retriever:
         self.invalid_chunk_count = invalid_chunk_count
         self.retrieval_degraded = retrieval_degraded
         self.retrieval_error = retrieval_error
+
+    def _embedding_fingerprint(self) -> str:
+        payload = f"{settings.embedding_model}|{settings.embedding_device}|{settings.embedding_cache_dir}|{settings.vector_collection}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _sync_vector_store(self, vector_store: Any, documents: list[Document]) -> None:
+        """Synchronize Chroma by stable IDs without resetting the collection."""
+        current = {
+            doc.metadata["chunk_id"]: hashlib.sha256(
+                (doc.page_content + "\n" + json.dumps(doc.metadata, ensure_ascii=False, sort_keys=True)).encode("utf-8")
+            ).hexdigest()
+            for doc in documents
+        }
+        fingerprint = self._embedding_fingerprint()
+        previous: dict[str, Any] = {}
+        try:
+            previous = json.loads(self._vector_sync_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        if previous.get("embedding_fingerprint") != fingerprint:
+            try:
+                vector_store.reset_collection()
+            except AttributeError:
+                pass
+            previous = {}
+
+        old_chunks = previous.get("chunks", {})
+        changed_ids = [chunk_id for chunk_id, digest in current.items() if old_chunks.get(chunk_id) != digest]
+        removed_ids = [chunk_id for chunk_id in old_chunks if chunk_id not in current]
+        if removed_ids:
+            vector_store.delete(ids=removed_ids)
+        if changed_ids:
+            by_id = {doc.metadata["chunk_id"]: doc for doc in documents}
+            vector_store.add_documents(
+                [by_id[chunk_id] for chunk_id in changed_ids],
+                ids=changed_ids,
+            )
+        self._vector_sync_path.write_text(
+            json.dumps({"embedding_fingerprint": fingerprint, "chunks": current}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _rrf_order(*ranked_lists: list[Document], constant: int = 60) -> list[Document]:
+        scores: dict[str, float] = {}
+        docs: dict[str, Document] = {}
+        for ranked in ranked_lists:
+            for rank, doc in enumerate(ranked, start=1):
+                chunk_id = doc.metadata["chunk_id"]
+                docs[chunk_id] = doc
+                scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (constant + rank)
+        return [
+            docs[chunk_id]
+            for chunk_id in sorted(
+                scores,
+                key=lambda item: (-scores[item], docs[item].metadata.get("page", 0), item),
+            )
+        ]
 
     @property
     def indexed(self) -> bool:
@@ -140,17 +202,25 @@ class Retriever:
         except (TypeError, ValueError):
             k = settings.top_k
         self.bm25.k = len(self.documents)
-        documents = self.bm25.invoke(question)
+        bm25_documents = self.bm25.invoke(question)
         if page is not None:
-            documents = [doc for doc in documents if doc.metadata.get("page") == page]
+            bm25_documents = [doc for doc in bm25_documents if doc.metadata.get("page") == page]
 
+        vector_documents: list[Document] = []
         if self.vector_store is not None:
-            vector_documents = self.vector_store.similarity_search(question, k=len(self.documents))
-            if page is not None:
-                vector_documents = [doc for doc in vector_documents if doc.metadata.get("page") == page]
-            seen = {doc.metadata["chunk_id"] for doc in documents}
-            documents.extend(doc for doc in vector_documents if doc.metadata["chunk_id"] not in seen)
+            try:
+                vector_documents = self.vector_store.similarity_search(
+                    question, k=min(len(self.documents), max(k * 4, 20))
+                )
+                if page is not None:
+                    vector_documents = [doc for doc in vector_documents if doc.metadata.get("page") == page]
+            except Exception as exc:
+                self.vector_store = None
+                self.mode = "bm25"
+                self.retrieval_degraded = True
+                self.retrieval_error = type(exc).__name__
 
+        documents = self._rrf_order(bm25_documents, vector_documents)
         explicit_section = any(term in question for term in ("目录", "目次", "摘要", "致谢", "谢辞", "参考文献", "引用文献"))
         apply_role_boost = page is None and not explicit_section
         ranked = []

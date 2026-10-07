@@ -20,19 +20,23 @@ copy .env.example .env
 DASHSCOPE_API_KEY=你的密钥
 OPENAI_BASE_URL=https://maas.qianwenaiapi.com/compatible-mode/v1
 CHAT_MODEL=qwen3.8-omni-flash
-EMBEDDING_MODEL=
+EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+EMBEDDING_DEVICE=cpu
+EMBEDDING_CACHE_DIR=
 ```
 
 - `OPENAI_API_KEY`：通用 OpenAI-compatible 服务密钥，可留空。
 - `DASHSCOPE_API_KEY`：通义千问兼容接口密钥；当 `OPENAI_API_KEY` 留空时作为聊天模型密钥使用。
 - `OPENAI_BASE_URL`：兼容服务地址，DashScope 示例为 `https://maas.qianwenaiapi.com/compatible-mode/v1`。
 - `CHAT_MODEL`：聊天模型名称，DashScope 示例为 `qwen3.8-omni-flash`；未配置有效密钥时仍可以建立索引和查询，查询会返回带页码的原文证据。
-- `EMBEDDING_MODEL`：可选 embedding 模型。留空时使用 BM25；配置后且 embedding 服务可用时尝试启用本地 Chroma 混合检索。DashScope 聊天密钥不会自动用于 embedding。
+- `EMBEDDING_MODEL`：可选本地 Hugging Face embedding 模型名称或本地目录；当前环境可使用 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`（已缓存）。首次使用其他模型可能需要下载模型文件并占用本机内存；模型下载完成后向量生成在本地执行，论文文本不会发送到 embedding 服务。留空时使用 BM25。
+- `EMBEDDING_DEVICE`：本地模型设备，默认 `cpu`；可按环境设为 `cuda`。
+- `EMBEDDING_CACHE_DIR`：可选模型缓存目录，留空时使用 Hugging Face 默认缓存。
 - `ENABLE_VECTOR`：是否允许 Chroma 分支，默认 `true`。
 - `ENABLE_OCR`：是否启用 RapidOCR，默认 `false`。开启后需要 `rapidocr-onnxruntime`；缺少依赖时会写入 warning 而不会阻塞摄取。
 - `VECTOR_COLLECTION`：Chroma collection 名称。
 
-LangChain 链路为：`Document` → `BM25Retriever`（可选 Chroma）→ `ChatPromptTemplate` → `ChatOpenAI`。没有 embedding 配置或向量服务失败时，系统自动保留 BM25 检索。
+LangChain 链路为：`Document` → `BM25Retriever` + 本地 Hugging Face embeddings / Chroma → RRF 排名融合 → `ChatPromptTemplate` → `ChatOpenAI`。未配置本地 embedding 模型或模型加载失败时，系统自动保留 BM25 检索；本地向量索引写入 `app_data/chroma`，同步状态保存在本地 `app_data/chroma_sync.json`。
 
 ## 2. 启动
 

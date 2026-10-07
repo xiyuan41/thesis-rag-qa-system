@@ -12,6 +12,14 @@ def test_dashscope_defaults_and_key_fallback(monkeypatch):
     assert settings.chat_api_key == "dash-key"
 
 
+def test_embedding_defaults_to_local_cpu_and_is_separate_from_chat_keys():
+    settings = Settings(_env_file=None, dashscope_api_key="chat-only")
+    assert settings.embedding_model == ""
+    assert settings.embedding_device == "cpu"
+    assert settings.embedding_cache_dir == ""
+    assert settings.chat_api_key == "chat-only"
+
+
 def test_explicit_openai_key_takes_precedence():
     settings = Settings(
         _env_file=None,

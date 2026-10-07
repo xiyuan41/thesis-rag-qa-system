@@ -1,4 +1,7 @@
 import json
+from unittest.mock import Mock
+
+from langchain_core.documents import Document
 
 from backend.retriever import Retriever
 
@@ -139,7 +142,73 @@ def test_corrupt_manifest_is_reported_without_discarding_loaded_index(tmp_path):
     assert retriever.load_error == "manifest_invalid"
 
 
-def test_missing_manifest_is_reported(tmp_path):
+
+
+def _doc(chunk_id: str, page: int = 1) -> Document:
+    return Document(page_content=chunk_id, metadata={"chunk_id": chunk_id, "page": page})
+
+
+def test_rrf_merges_and_deduplicates_bm25_and_vector_results():
+    bm25 = [_doc("shared"), _doc("keyword")]
+    vector = [_doc("shared"), _doc("semantic")]
+
+    ranked = Retriever._rrf_order(bm25, vector)
+
+    assert [doc.metadata["chunk_id"] for doc in ranked] == ["shared", "keyword", "semantic"]
+
+
+def test_hybrid_search_uses_rrf_and_page_filter():
+    retriever = Retriever.__new__(Retriever)
+    retriever.documents = [_doc("bm25"), _doc("vector"), _doc("other", page=2)]
+    retriever.bm25 = Mock()
+    retriever.bm25.invoke.return_value = retriever.documents
+    retriever.vector_store = Mock()
+    retriever.vector_store.similarity_search.return_value = [_doc("vector"), _doc("other", page=2)]
+    retriever.mode = "hybrid"
+    retriever.retrieval_degraded = False
+    retriever.retrieval_error = None
+
+    results = retriever.search("question", top_k=2, page=1)
+
+    assert [item["id"] for item in results] == ["vector", "bm25"]
+    retriever.vector_store.similarity_search.assert_called_once()
+
+
+def test_vector_search_failure_keeps_bm25_results():
+    retriever = Retriever.__new__(Retriever)
+    retriever.documents = [_doc("bm25")]
+    retriever.bm25 = Mock()
+    retriever.bm25.invoke.return_value = retriever.documents
+    retriever.vector_store = Mock()
+    retriever.vector_store.similarity_search.side_effect = RuntimeError("offline")
+    retriever.mode = "hybrid"
+    retriever.retrieval_degraded = False
+    retriever.retrieval_error = None
+
+    results = retriever.search("question", top_k=1)
+
+    assert [item["id"] for item in results] == ["bm25"]
+    assert retriever.mode == "bm25"
+    assert retriever.retrieval_degraded is True
+    assert retriever.retrieval_error == "RuntimeError"
+
+
+def test_vector_sync_only_updates_changed_chunks_and_removes_deleted(tmp_path):
+    retriever = Retriever.__new__(Retriever)
+    retriever._vector_sync_path = tmp_path / "sync.json"
+    retriever._embedding_fingerprint = lambda: "model-v1"
+    retriever._vector_sync_path.write_text(
+        json.dumps({"embedding_fingerprint": "model-v1", "chunks": {"same": "old", "deleted": "x"}}),
+        encoding="utf-8",
+    )
+    store = Mock()
+    documents = [_doc("same")]
+    retriever._sync_vector_store(store, documents)
+
+    store.reset_collection.assert_not_called()
+    store.delete.assert_called_once_with(ids=["deleted"])
+    store.add_documents.assert_called_once()
+    assert json.loads(retriever._vector_sync_path.read_text(encoding="utf-8"))["chunks"].keys() == {"same"}
     retriever = Retriever.__new__(Retriever)
     retriever.manifest_path = tmp_path / "missing.json"
     retriever.documents = []

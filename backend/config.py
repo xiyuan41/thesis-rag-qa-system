@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://maas.qianwenaiapi.com/compatible-mode/v1"
     chat_model: str = "qwen3.8-omni-flash"
     embedding_model: str = ""
+    embedding_device: str = "cpu"
+    embedding_cache_dir: str = ""
     api_host: str = "127.0.0.1"
     api_port: int = 8000
     frontend_api_url: str = "http://127.0.0.1:8000"
